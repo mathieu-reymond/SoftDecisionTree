@@ -10,10 +10,11 @@ from torch.utils.tensorboard import SummaryWriter
 
 
 class SoftDecisionTree(nn.Module):
-    def __init__(self, args):
+    def __init__(self, args, normalization=None):
         super(SoftDecisionTree, self).__init__()
         self.args = args
         self.depth = self.args.depth
+        self.normalization = 1 if normalization is None else normalization
         # Inner nodes
         self.num_inners = 2 ** self.depth - 1
         self.weights = nn.Parameter(torch.empty(self.num_inners, self.args.input_dim), requires_grad=True)
@@ -33,7 +34,7 @@ class SoftDecisionTree(nn.Module):
         self.ancestors_leafs = [self._ancestors(i + self.num_inners) for i in range(self.num_leafs)]
         # Optimizer
         self.to(device=args.device)
-        self.optimizer = optim.Adam(self.parameters())
+        self.optimizer = optim.Adam(self.parameters(), lr=1e-3)
         # Logging
         self.best_test_loss = math.inf
         self.writer = SummaryWriter(Path(self.args.save)) if self.args.tensorboard else None
@@ -101,12 +102,22 @@ class SoftDecisionTree(nn.Module):
 
     def _calc_loss(self, x, y):
         # Leaf loss
-        leafs_pred = F.log_softmax(self.leafs, dim=1)
+        leafs_pred = torch.sigmoid(self.leafs)
         probs_right = torch.sigmoid(self.betas * torch.addmm(self.biases, x, self.weights.t()))
         leaf_path_probs = self._calc_path_probs(probs_right, self.ancestors_leafs)
         # loss_leafs = torch.sum(leaf_path_probs * y.matmul(leafs_pred.t()), dim=1).neg().log().mean() # Loss
         # according to paper, yet this diverges after a couple of epochs
-        loss_leafs = torch.sum(leaf_path_probs * y.matmul(leafs_pred.t()), dim=1).neg().mean()
+        # for each leaf, compute difference with output
+        # weighted output of decision tree:
+        weighted_leaves_pred = leafs_pred[None]*leaf_path_probs[...,None]
+        # sum over all leaves
+        weighted_leaves_pred = weighted_leaves_pred.sum(dim=1)
+        # mse = (y[:, None] - leafs_pred[None])**2
+        # mse = mse.mean(-1)
+        # loss_leafs = torch.sum(leaf_path_probs * mse, dim=1).neg().mean()
+        mse = (y - weighted_leaves_pred)**2
+        loss_leafs = mse.mean()
+        # loss_leafs = torch.sum(leaf_path_probs * y.matmul(leafs_pred.t()), dim=1).neg().mean()
 
         # Regularization inners: tree balancing by binary cross-entropy with discrete uniform(2) distribution
         inner_path_probs = self._calc_path_probs(probs_right, self.ancestors_inners)
@@ -118,9 +129,23 @@ class SoftDecisionTree(nn.Module):
         loss_inners = F.binary_cross_entropy(alpha_inners, self._alpha_target, weight=self.lambda_per_inner,
                                              reduction='sum')
 
-        total_loss = loss_leafs + loss_inners
+        total_loss = loss_leafs #+ 0.1*loss_inners
 
         return total_loss, loss_leafs, loss_inners
+
+    def predict_regression(self, x):
+        # Leaf loss
+        leafs_pred = torch.sigmoid(self.leafs)
+        probs_right = torch.sigmoid(self.betas * torch.addmm(self.biases, x, self.weights.t()))
+        leaf_path_probs = self._calc_path_probs(probs_right, self.ancestors_leafs)
+        # loss_leafs = torch.sum(leaf_path_probs * y.matmul(leafs_pred.t()), dim=1).neg().log().mean() # Loss
+        # according to paper, yet this diverges after a couple of epochs
+        # for each leaf, compute difference with output
+        # weighted output of decision tree:
+        weighted_leaves_pred = leafs_pred[None]*leaf_path_probs[...,None]
+        # sum over all leaves
+        weighted_leaves_pred = weighted_leaves_pred.sum(dim=1)
+        return weighted_leaves_pred
 
     @torch.no_grad()
     def test_(self, test_loader, epoch):
